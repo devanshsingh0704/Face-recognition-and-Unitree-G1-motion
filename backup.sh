@@ -6,10 +6,26 @@ WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QUIET=0
 [[ "${1:-}" == "-q" ]] && QUIET=1
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
-DEST="$WS/.fr_backup_${STAMP}"
-LATEST="$WS/.fr_backup_latest"
+# Snapshots live OUTSIDE the workspace, in $HOME.
+#
+# They contain context.md, which carries the robot addresses and SSH password.
+# Keeping copies of that inside the workspace put credentials inside the
+# directory we publish from, guarded only by a .gitignore line -- and on
+# 2026-09-03 a fresh `git init` did sweep a saved .git directory into a commit
+# (66 of 93 tracked files) before a content scan caught it. One boundary that
+# does not depend on getting an ignore pattern right is worth more than five
+# copies that do.
+#
+# Override with FR_ARCHIVE if you want them somewhere else.
+ARCHIVE="${FR_ARCHIVE:-$HOME/fr_history_archive}"
 
+STAMP="$(date +%Y%m%d_%H%M%S)"
+DEST="$ARCHIVE/.fr_backup_${STAMP}"
+LATEST="$ARCHIVE/.fr_backup_latest"
+
+# 700: these snapshots hold a password, so keep them to this account.
+mkdir -p "$ARCHIVE"
+chmod 700 "$ARCHIVE"
 mkdir -p "$DEST/scripts"
 
 copy() {
@@ -37,8 +53,10 @@ fi
 
 ln -sfn "$DEST" "$LATEST"
 
-# Prune old backups (keep last 10).
-mapfile -t OLD < <(ls -dt "$WS"/.fr_backup_20* 2>/dev/null | tail -n +11 || true)
+# Prune old backups (keep last 10). Scoped to the archive so a stray
+# .fr_backup_* left in the workspace is never a deletion target -- this only
+# removes what this script created.
+mapfile -t OLD < <(ls -dt "$ARCHIVE"/.fr_backup_20* 2>/dev/null | tail -n +11 || true)
 for d in "${OLD[@]}"; do
   [[ -d "$d" && "$d" != "$DEST" ]] && rm -rf "$d"
 done
@@ -46,4 +64,6 @@ done
 if [[ "$QUIET" -eq 0 ]]; then
   echo "Backed up to $DEST"
   echo "Latest symlink: $LATEST -> $DEST"
+  echo "Archive is outside the workspace, so snapshots of context.md (which"
+  echo "holds the robot password) are never inside the published tree."
 fi

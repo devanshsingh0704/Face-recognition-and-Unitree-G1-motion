@@ -4,10 +4,29 @@
 set -euo pipefail
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-SRC="${1:-$WS/.fr_backup_latest}"
-if [[ ! -d "$SRC" ]]; then
-  echo "No backup found at: $SRC" >&2
-  echo "Run ./backup.sh first, or pass a backup directory." >&2
+# Backups live outside the workspace -- see the note in backup.sh. Override
+# with FR_ARCHIVE, matching backup.sh.
+ARCHIVE="${FR_ARCHIVE:-$HOME/fr_history_archive}"
+
+SRC="${1:-}"
+if [[ -z "$SRC" ]]; then
+  # Prefer the symlink, but fall back to the newest snapshot by mtime. The
+  # symlink is the one part of this that can go stale -- it broke once when the
+  # directory it named was moved -- and "restore the newest" is what someone
+  # running this in a hurry means anyway.
+  if [[ -d "$ARCHIVE/.fr_backup_latest" ]]; then
+    SRC="$ARCHIVE/.fr_backup_latest"
+  else
+    SRC="$(ls -dt "$ARCHIVE"/.fr_backup_20* 2>/dev/null | head -1 || true)"
+    [[ -n "$SRC" ]] && echo "No 'latest' link; using newest snapshot instead."
+  fi
+fi
+
+if [[ -z "$SRC" || ! -d "$SRC" ]]; then
+  echo "No backup found in $ARCHIVE" >&2
+  echo "Run ./backup.sh first, or pass a snapshot directory:" >&2
+  echo "    ./recover.sh $ARCHIVE/.fr_backup_YYYYMMDD_HHMMSS" >&2
+  ls -1dt "$ARCHIVE"/.fr_backup_20* 2>/dev/null | head -5 | sed 's|^|  available: |' >&2 || true
   exit 1
 fi
 
