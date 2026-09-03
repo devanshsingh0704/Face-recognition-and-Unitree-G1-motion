@@ -1,0 +1,13 @@
+{
+  "threshold": 0.45,
+  "metrics": {
+    "fmr": 0.0,
+    "fnmr": 0.0,
+    "n_genuine": 25,
+    "n_impostor": 1360,
+    "target_fmr": 0.001,
+    "genuine_from_enrolment": false,
+    "impostor_max": 0.3743097484111786,
+    "genuine_min": 0.5177816152572632
+  }
+}

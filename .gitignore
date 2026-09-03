@@ -1,0 +1,58 @@
+# ---------------------------------------------------------- personal data
+# The gallery holds face embeddings of named, identifiable people, and the
+# baseline holds their names alongside reference match scores. Biometric
+# identifiers are not ours to publish. Excluding them costs a clone nothing it
+# should not pay: enroll.py builds a gallery from your own photos, and every
+# consumer already fails with instructions when these are absent.
+db/embeddings.npz
+db/baseline.json
+db/*.backup.*
+dataset/
+
+# db/config.json IS tracked on purpose -- threshold plus aggregate metrics,
+# no names. It is what makes the README's numbers checkable.
+
+# ------------------------------------------------------- internal documents
+# Handover notes: robot addresses, login details, colleague names, site
+# specifics. Useful locally, not publishable, and scrubbing it would remove
+# the reason it exists. README.md is the public document.
+context.md
+
+# ------------------------------------------------------------------- models
+# ~53 MB of ONNX, and fully reproducible: install.sh fetches buffalo_s from
+# the InsightFace release and prunes the parts we do not use.
+models/
+
+# ------------------------------------------------------------------ secrets
+# Robot host/user/password live outside the repo. See .fr_robots.env.example
+.fr_robots.env
+
+# ---------------------------------------------------------------- generated
+venv/
+__pycache__/
+*.pyc
+*.pyo
+log.log
+output/
+*.jpg
+*.jpeg
+*.png
+
+# Test traces from the locomotion work (~/fr_tests also holds these)
+*.csv
+
+# Local safety copies
+.fr_backup_*/
+.fr_prepush_*/
+face_recognition_ws.bak.*/
+
+# Saved-aside git histories. These MUST stay out: a .git directory's objects
+# contain blobs of everything it ever tracked -- including the gallery and the
+# passworded handover notes this .gitignore exists to exclude. Committing one
+# would smuggle the whole lot back in as loose objects. Caught exactly that on
+# 2026-09-03: 66 of 93 tracked files were a saved .git.bak.
+.git.bak*/
+*.git.bak/
+
+# Symlink into an ignored backup directory -- meaningless in a clone.
+.fr_backup_latest
