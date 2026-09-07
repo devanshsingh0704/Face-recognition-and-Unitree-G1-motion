@@ -257,7 +257,27 @@ TURN_MIN_VX_RATIO = 0.35      # slowest forward fraction at full offset
 
 DEFAULT_MOVE_VX = 0.12
 DEFAULT_MAX_OMEGA = 0.40
-DEFAULT_MOVE_TIMEOUT = 30.0
+
+# 0 = no cap: follow until the standoff is reached, the operator stops it, or a
+# real failure is detected. A mission is meant to end because it succeeded, not
+# because a clock ran out on a chase that was still closing.
+#
+# Was 30 s, which could never work for a target who moves. Effective ground
+# speed is ~0.04-0.08 m/s -- commanded 0.12, scaled down by TURN_MIN_VX_RATIO
+# whenever there is yaw to correct and again inside SLOW_RADIUS_M, then only
+# 50-70% of that is achieved -- so 30 s bought 1.2-2.5 m of travel per click.
+# Measured: it gave up 1.56 m short of a walking target (tape-measured; the
+# depth reading agreed to 10 cm once camera-to-face slant is accounted for).
+#
+# What still ends a mission, so removing this leaves the robot bounded:
+#   - arrival at cfg.stop_distance_m, over MOVE_REACHED_STABLE_FRAMES frames
+#   - the operator deadman (now the ONLY bound on total walking time)
+#   - stall detection: commands sent, no closest-approach progress -- the check
+#     that catches a robot which is not in walking FSM 501 at all
+#   - search_timeout: no sighting of the target for that long
+#   - Stop movement, which needs no token
+# An obstacle does NOT end the mission: it halts and waits, then resumes.
+DEFAULT_MOVE_TIMEOUT = 0.0
 
 # Operator deadman.
 #
@@ -1669,10 +1689,15 @@ def move_loop(loco: G1Locomotion | None, cfg: MoveConfig) -> None:
             continue
         reached_stable = 0
 
-        if started_at and (time.perf_counter() - started_at) >= cfg.timeout:
-            _finish(loco, execute, "stopped",
-                    f"timeout ({cfg.timeout:.0f}s) — stopped")
-            continue
+        # NOTE: a wall-clock check lived here -- `elapsed >= cfg.timeout` since
+        # the click. It was removed deliberately. It contradicted MoveConfig's
+        # own contract for this field ("not wall-clock since the click; blocked,
+        # halted and search time do not count"), it sat ABOVE the blocked branch
+        # so waiting for an obstacle to clear consumed the allowance, it had no
+        # `> 0` guard so a 0 meant "stop instantly" rather than "no limit", and
+        # being wall-clock it always fired before the forward-motion budget
+        # below -- making that one unreachable. The forward-motion budget is the
+        # documented behaviour and is kept, opt-in via --move-timeout.
 
         if blocked:
             # Stop and wait rather than steer around it. Nothing here plans a
@@ -1953,9 +1978,10 @@ def main() -> int:
                     help="stop and wait if the forward corridor is closer than "
                          "this (metres); needs depth")
     ap.add_argument("--move-timeout", type=float, default=DEFAULT_MOVE_TIMEOUT,
-                    help="max seconds spent commanding forward motion toward "
-                         "the target. Blocked, halted, and search time do "
-                         "not count")
+                    help="optional cap on seconds spent commanding forward "
+                         "motion toward the target; blocked, halted and search "
+                         "time do not count. Default %(default)s = no cap: "
+                         "follow until reached, stopped, stalled or lost")
     ap.add_argument("--search-timeout", type=float,
                     default=DEFAULT_SEARCH_TIMEOUT,
                     help="give up a mission after this many seconds with no "
@@ -2081,8 +2107,11 @@ def main() -> int:
           f"obstacle stop {args.obstacle_distance:.2f} m, iface={args.move_iface}")
     print(f"       one click per mission: {MOVE_CONFIRM_S:.0f}s first confirm, "
           f"{MOVE_RESUME_CONFIRM_S:.0f}s resume; losing the face searches")
-    print(f"       budgets: {args.move_timeout:.0f}s of forward motion, "
-          f"{args.search_timeout:.0f}s without sight of the target")
+    print("       budgets: %s, %.0fs without sight of the target"
+          % ("no forward-motion cap (follows until reached)"
+             if args.move_timeout <= 0 else
+             "%.0fs of forward motion" % args.move_timeout,
+             args.search_timeout))
     print("       dry-run until 'Enable walk' is ticked on the dashboard")
     print(f"       deadman: {MOVE_HEARTBEAT_GRACE_S:.0f}s grace, then "
           f"{args.heartbeat_timeout:.0f}s without dashboard contact")
