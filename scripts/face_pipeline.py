@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,85 @@ def configure_runtime_threads(n: int = DEFAULT_INFERENCE_THREADS) -> None:
         os.environ.setdefault(var, str(n))
 
 
+# Per-model thread budgets, independently tunable. 0 means "let onnxruntime
+# decide", which is its own default and exactly what ran here before these knobs
+# existed -- so 0/0 reproduces the previous behaviour bit for bit.
+#
+# MEASURED on the G1 (Orin NX, 8 cores, MAXN, 640x480, via verify_deploy.py):
+#   det 0 / emb 0   detect 41 ms          embed 20.5 ms        ~16.3 fps
+#   det 4 / emb 4   detect 42.9-44.6 ms   embed 20.8-21.2 ms   15.2-15.7 fps
+#   det 6 / emb 2   detect 38.2 ms        embed 28.6 ms        15.0 fps
+#
+# Two things that contradict the obvious guess: capping threads at 4 is SLOWER
+# than leaving it alone, and the recogniser gets much worse with few threads
+# (28.6 ms at 2) even though it only runs a 112x112 crop. Detection alone is
+# fastest around 6. Do not change these without re-measuring.
+DET_THREADS = int(os.environ.get("FR_DET_THREADS", "0"))
+EMB_THREADS = int(os.environ.get("FR_EMB_THREADS", "0"))
+
+
+def threads_label(n: int) -> str:
+    """How a thread budget reads in a banner: 0 is not 'zero threads'."""
+    return "auto" if n <= 0 else str(n)
+
+# Where to run inference. "auto" uses the GPU when onnxruntime offers one and
+# silently stays on CPU when it does not, so this is safe on a CPU-only install.
+# "gpu" warns loudly rather than failing if no GPU provider exists -- a robot
+# that still works is worth more than a strict startup error.
+FR_DEVICE = os.environ.get("FR_DEVICE", "auto").strip().lower()
+
+# TensorRT first: on JetPack it fuses and runs in FP16, which is the whole point
+# of having it. CUDA is the fallback that needs no engine build.
+GPU_PROVIDERS = ("TensorrtExecutionProvider", "CUDAExecutionProvider")
+
+
+def select_providers() -> tuple[list[str], int]:
+    """(onnxruntime providers, insightface ctx_id) for the requested device.
+
+    ctx_id matters: both SCRFD.prepare and ArcFaceONNX.prepare call
+    set_providers(['CPUExecutionProvider']) when ctx_id < 0, which would undo a
+    GPU session. So GPU must pass ctx_id >= 0, and CPU passes -1.
+    """
+    if FR_DEVICE == "cpu":
+        return ["CPUExecutionProvider"], -1
+
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    usable = [p for p in GPU_PROVIDERS if p in available]
+    if not usable:
+        if FR_DEVICE == "gpu":
+            print("[fr] FR_DEVICE=gpu but onnxruntime offers no GPU provider "
+                  f"(available: {', '.join(available)}). Staying on CPU. This "
+                  "build is the CPU-only wheel; a Jetson needs NVIDIA's "
+                  "JetPack-matched onnxruntime-gpu.", file=sys.stderr)
+        return ["CPUExecutionProvider"], -1
+    # Keep CPU last as a per-node fallback for anything the GPU EP rejects.
+    return usable + ["CPUExecutionProvider"], 0
+
+
+def make_session(model_path, threads: int, providers: list[str]):
+    """An onnxruntime session with an explicit thread budget.
+
+    intra_op is the knob that matters for these models; inter_op is pinned to 1
+    because both graphs are a single sequential chain and extra inter-op threads
+    only add scheduling overhead.
+    """
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+    if threads > 0:
+        # Only touch these when asked. Leaving them at onnxruntime's own default
+        # measured faster than any cap we tried, so 0 must mean "hands off",
+        # not "one thread".
+        opts.intra_op_num_threads = threads
+        opts.inter_op_num_threads = 1
+    # Already onnxruntime's default; stated so a future default change is visible.
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(str(model_path), sess_options=opts,
+                                providers=providers)
+
+
 # Faces smaller than this are too low-resolution for a reliable embedding.
 #
 # Measured by rescaling the held-out photos to an exact face width:
@@ -104,6 +184,9 @@ class FacePipeline:
     ) -> None:
         """backend 'arcface' = SCRFD + ArcFace (default), 'sface' = YuNet + SFace."""
         self.backend = backend
+        # Overwritten by the arcface branch with the real onnxruntime providers;
+        # the sface branch runs through OpenCV's own DNN backend, not onnxruntime.
+        self.providers = ["OpenCV-DNN"]
 
         if backend == "arcface":
             for path in (ARCFACE_DETECTOR, ARCFACE_RECOGNIZER):
@@ -113,14 +196,29 @@ class FacePipeline:
                         "Download buffalo_s from the InsightFace releases page and "
                         f"unzip it into {ARCFACE_DIR}"
                     )
-            from insightface.model_zoo import get_model
+            # Sessions are built here rather than left to get_model() so the
+            # execution provider and the thread budget are ours to set. Same two
+            # classes get_model() would have routed to for these files.
+            from insightface.model_zoo.arcface_onnx import ArcFaceONNX
+            from insightface.model_zoo.scrfd import SCRFD
 
-            self.detector = get_model(str(ARCFACE_DETECTOR))
-            self.detector.prepare(ctx_id=-1, input_size=(640, 640),
+            providers, ctx_id = select_providers()
+
+            self.detector = SCRFD(
+                model_file=str(ARCFACE_DETECTOR),
+                session=make_session(ARCFACE_DETECTOR, DET_THREADS, providers),
+            )
+            self.detector.prepare(ctx_id=ctx_id, input_size=(640, 640),
                                   det_thresh=det_score_threshold)
-            self.recognizer = get_model(str(ARCFACE_RECOGNIZER))
-            self.recognizer.prepare(ctx_id=-1)
+            self.recognizer = ArcFaceONNX(
+                model_file=str(ARCFACE_RECOGNIZER),
+                session=make_session(ARCFACE_RECOGNIZER, EMB_THREADS, providers),
+            )
+            self.recognizer.prepare(ctx_id=ctx_id)
             self.embedding_dim = 512
+            # What actually got used, for benchmark.py and the startup banner --
+            # onnxruntime silently falls back, so asking is the only way to know.
+            self.providers = list(self.detector.session.get_providers())
             return
 
         for path in (DETECTOR_MODEL, RECOGNIZER_MODEL):

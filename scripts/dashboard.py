@@ -58,6 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from g1_locomotion import G1Locomotion
 from face_pipeline import (
     CONFIG_PATH,
+    DET_THREADS,
+    EMB_THREADS,
     MIN_FACE_WIDTH_PX,
     FacePipeline,
     FaceTracker,
@@ -65,6 +67,7 @@ from face_pipeline import (
     configure_runtime_threads,
     load_threshold,
     open_camera,
+    threads_label,
 )
 
 # Detection stays at full resolution. Downscaling to 0.5 was 3x faster but cost
@@ -75,6 +78,12 @@ from face_pipeline import (
 #
 # The real saving is recognition: it costs ~28 ms per face against detection's
 # ~11 ms, and a face does not change identity between frames.
+# NOTE: this has no effect on the default 'arcface' backend. SCRFD letterboxes
+# internally to its prepared 640x640 input, so detection already costs the same
+# regardless of frame size and FacePipeline.detect() returns before `scale` is
+# read (see the early return in face_pipeline.detect). It is honoured only by the
+# legacy 'sface' backend. Left in place for that path -- do not spend time
+# tuning it expecting a speedup here.
 DETECT_SCALE = 1.0
 RECOGNISE_EVERY = 3
 SMOOTH_FRAMES = 9
@@ -91,6 +100,14 @@ HOLD_RATIO = 0.85
 MIN_DETECT_CONFIDENCE = 0.55
 
 JPEG_QUALITY = 80
+
+# The browser stream is downscaled to this width before encoding when the
+# capture frame is wider. Processing still runs at full capture resolution --
+# only the picture sent to the browser shrinks -- so range and accuracy are
+# untouched while the JPEG encode and the wifi both get cheaper. 0 disables it.
+# Matters here because the operator deadman fires on dashboard silence and this
+# robot's wifi is unreliable: a lighter stream is a steadier heartbeat.
+STREAM_MAX_WIDTH = 960
 
 # Capture resolution sets the working range, because range is pure optics.
 # Measured D435i focal lengths, and the distance at which a face is 32px wide
@@ -321,6 +338,7 @@ state = {
     "raw_version": 0,
     "frame": None,       # newest annotated + JPEG-encoded frame
     "frame_version": 0,
+    "viewers": 0,        # open /video_feed streams; 0 means skip annotate+encode
     "running": True,
     "detect_ms": 0.0,
     "embed_ms": 0.0,
@@ -965,17 +983,34 @@ def grab_loop(source) -> None:
 
 def annotate_loop() -> None:
     """Draw the most recent detections onto the most recent frame and encode."""
+    stream_max_w = app.config.get("STREAM_MAX_WIDTH", STREAM_MAX_WIDTH)
     last = -1
     frames, t0 = 0, time.perf_counter()
+    idle = False              # True while no viewer is attached
     while state["running"]:
         with lock:
             frame, version = state["raw"], state["raw_version"]
             faces = list(state["faces"])
             move_target = move_state["target"] if move_state["active"] else ""
+            viewers = state["viewers"]
         if frame is None or version == last:
             time.sleep(0.002)
             continue
         last = version
+
+        # With nobody watching, the annotated JPEG is built and thrown away --
+        # ~30 full-resolution encodes a second, most of them during missions when
+        # move_loop wants the CPU. state["fps"] means "rate the browser is being
+        # fed", so reporting 0 here is the truth, not a gap.
+        if viewers <= 0:
+            if not idle:
+                idle = True
+                with lock:
+                    state["fps"] = 0.0
+            frames, t0 = 0, time.perf_counter()
+            continue
+        idle = False
+
         canvas = frame.copy()
 
         if move_target:
@@ -1008,6 +1043,15 @@ def annotate_loop() -> None:
             with lock:
                 state["fps"] = frames / elapsed
             frames, t0 = 0, time.perf_counter()
+
+        # Shrink only the outgoing picture. Boxes and labels are drawn at full
+        # resolution first and scale down with it, which keeps this a two-line
+        # change instead of rescaling every coordinate.
+        if stream_max_w and canvas.shape[1] > stream_max_w:
+            ratio = stream_max_w / canvas.shape[1]
+            canvas = cv2.resize(canvas, (stream_max_w,
+                                         max(1, int(round(canvas.shape[0] * ratio)))),
+                                interpolation=cv2.INTER_AREA)
 
         ok, buf = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ok:
@@ -1728,27 +1772,38 @@ def index():
 @require_auth
 def video_feed():
     def generate():
-        # Send each frame once, as soon as it exists. The previous version slept
-        # a fixed 30 ms per iteration and re-sent whatever was in the buffer,
-        # which both capped the stream and added latency on top of the pipeline.
-        last_seen = -1
-        sent = 0
-        while state["running"]:
+        # Register as a viewer BEFORE the first wait. annotate_loop only encodes
+        # while this count is above zero, so incrementing late would mean waiting
+        # for a frame nothing is producing. The finally runs on client
+        # disconnect too, which reaches a generator as GeneratorExit.
+        with lock:
+            state["viewers"] += 1
+        try:
+            # Send each frame once, as soon as it exists. The previous version
+            # slept a fixed 30 ms per iteration and re-sent whatever was in the
+            # buffer, which both capped the stream and added latency on top of
+            # the pipeline.
+            last_seen = -1
+            sent = 0
+            while state["running"]:
+                with lock:
+                    frame, version = state["frame"], state["frame_version"]
+                    move_active = move_state["active"]
+                if frame is None or version == last_seen:
+                    time.sleep(0.005)
+                    continue
+                last_seen = version
+                sent += 1
+                # A second deadman source: the MJPEG reader keeps running even
+                # when the status poll is throttled in a background tab.
+                if move_active and sent % 12 == 0:
+                    _note_operator_alive()
+                yield (b"--f\r\nContent-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
+                       + frame + b"\r\n")
+        finally:
             with lock:
-                frame, version = state["frame"], state["frame_version"]
-                move_active = move_state["active"]
-            if frame is None or version == last_seen:
-                time.sleep(0.005)
-                continue
-            last_seen = version
-            sent += 1
-            # A second deadman source: the MJPEG reader keeps running even when
-            # the status poll is throttled in a background tab.
-            if move_active and sent % 12 == 0:
-                _note_operator_alive()
-            yield (b"--f\r\nContent-Type: image/jpeg\r\n"
-                   b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
-                   + frame + b"\r\n")
+                state["viewers"] = max(0, state["viewers"] - 1)
 
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=f")
 
@@ -1912,6 +1967,11 @@ def main() -> int:
     ap.add_argument("--step-interval", type=float, default=MOVE_STEP_INTERVAL,
                     help="seconds between velocity commands (default "
                          "%(default)s)")
+    ap.add_argument("--stream-width", type=int, default=STREAM_MAX_WIDTH,
+                    help="downscale the browser stream to this width before "
+                         "encoding; processing stays at full capture "
+                         "resolution. 0 sends the full frame (default "
+                         "%(default)s)")
     ap.add_argument("--chunk-duration", type=float, default=None,
                     help="how long each velocity command stays valid; must "
                          "exceed --step-interval (default: step-interval + "
@@ -1953,6 +2013,7 @@ def main() -> int:
     token = args.token or secrets.token_urlsafe(9)
     app.config["TOKEN"] = token
     app.config["HEARTBEAT_TIMEOUT"] = args.heartbeat_timeout
+    app.config["STREAM_MAX_WIDTH"] = max(0, args.stream_width)
 
     auth = load_auth()
     app.config["AUTH"] = auth
@@ -1965,6 +2026,11 @@ def main() -> int:
     configure_runtime_threads()
     db = IdentityDB.load()
     pipeline = FacePipeline()
+    # Name the provider that actually loaded. onnxruntime falls back to CPU
+    # without raising, so "I installed the GPU build" is not evidence it is in use.
+    print(f"Inference: {pipeline.providers[0]} "
+          f"(det threads {threads_label(DET_THREADS)}, "
+          f"embed {threads_label(EMB_THREADS)})", flush=True)
     state["threshold"] = load_threshold()
     source = "realsense" if args.realsense else args.camera
     app.config["ENROLLED"] = db.names
