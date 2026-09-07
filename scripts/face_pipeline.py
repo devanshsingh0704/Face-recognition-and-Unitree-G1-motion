@@ -65,20 +65,37 @@ def configure_runtime_threads(n: int = DEFAULT_INFERENCE_THREADS) -> None:
         os.environ.setdefault(var, str(n))
 
 
-# Per-model thread budgets, independently tunable. 0 means "let onnxruntime
-# decide", which is its own default and exactly what ran here before these knobs
-# existed -- so 0/0 reproduces the previous behaviour bit for bit.
+# Per-model thread budgets. 0 means "let onnxruntime decide", which is its own
+# default. Both are overridable: FR_DET_THREADS / FR_EMB_THREADS.
 #
-# MEASURED on the G1 (Orin NX, 8 cores, MAXN, 640x480, via verify_deploy.py):
-#   det 0 / emb 0   detect 41 ms          embed 20.5 ms        ~16.3 fps
-#   det 4 / emb 4   detect 42.9-44.6 ms   embed 20.8-21.2 ms   15.2-15.7 fps
-#   det 6 / emb 2   detect 38.2 ms        embed 28.6 ms        15.0 fps
+# DETECTOR CAPPED AT 6 because onnxruntime's intra-op pool BUSY-SPINS between
+# operators. Left uncapped it takes every core it can and spends the surplus
+# spinning, which contends with the capture, encode and locomotion threads
+# instead of doing work. Measured live on the G1 (Orin NX, 8 cores, MAXN) at
+# 1280x720 with no viewer attached:
 #
-# Two things that contradict the obvious guess: capping threads at 4 is SLOWER
-# than leaving it alone, and the recogniser gets much worse with few threads
-# (28.6 ms at 2) even though it only runs a 112x112 crop. Detection alone is
-# fastest around 6. Do not change these without re-measuring.
-DET_THREADS = int(os.environ.get("FR_DET_THREADS", "0"))
+#              CPU(1 core=100%)  detect_ms  infer_fps  OS threads  load avg
+#   det auto        765%            72.0       13.9        43       10.07
+#   det 6           609%            45.2       22.1        32        6.67
+#
+# So capping frees ~1.5 cores AND nearly doubles recognition throughput. The
+# giveaway that this is spin, not work: removing ~195 ms/s of JPEG encoding made
+# total CPU go UP at auto, because the freed cores went straight into spinning.
+#
+# THE RECOGNISER IS LEFT ON AUTO, deliberately. Capping it does not help and can
+# hurt: 2 threads pushed embed to 28.6 ms, 4 threads measured a 21.49 ms median
+# live against 18.3-20.8 ms on auto. Embedding runs on roughly a third of frames
+# (~8/s), so a 1-3 ms difference is 1-2% of one core -- not worth owning a value
+# for. Fewer knobs set is fewer knobs to keep in step.
+#
+# CAVEAT: 6 was measured on THIS 8-core Orin NX. On a different host (the Go2's
+# Jetson, a laptop) re-measure rather than inheriting it; set FR_DET_THREADS=0
+# to get onnxruntime's own choice back.
+#
+# Thread count changes scheduling, never arithmetic: verify_deploy.py re-scored
+# the three reference photos at both settings with identical deltas
+# (0.0015 / 0.0013 / 0.0004). This is not an accuracy tradeoff.
+DET_THREADS = int(os.environ.get("FR_DET_THREADS", "6"))
 EMB_THREADS = int(os.environ.get("FR_EMB_THREADS", "0"))
 
 
